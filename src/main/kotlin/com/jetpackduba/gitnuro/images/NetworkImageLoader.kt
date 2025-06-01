@@ -6,35 +6,40 @@ import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.res.useResource
 import com.jetpackduba.gitnuro.extensions.acquireAndUse
 import com.jetpackduba.gitnuro.extensions.toByteArray
+import com.jetpackduba.gitnuro.logging.printLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.jetbrains.skia.Image
 import java.io.FileNotFoundException
 import java.net.HttpURLConnection
 import java.net.URL
 
-private const val MAX_LOADING_IMAGES = 3
+private const val MAX_LOADING_IMAGES = 10
+
+private const val TAG = "NetworkImageLoader"
 
 object NetworkImageLoader {
     private val loadingImagesSemaphore = Semaphore(MAX_LOADING_IMAGES)
     private val cache: ImagesCache = InMemoryImagesCache
+    private val requests = mutableMapOf<String, Mutex>()
 
-    fun loadCachedImage(url: String): ImageBitmap? {
-        val cachedImage = cache.getCachedImage(url)
-
-        return cachedImage?.toComposeImage()
-    }
-
-    suspend fun loadImageNetwork(url: String): ImageBitmap? = withContext(Dispatchers.IO) {
-        try {
+    suspend fun loadImage(url: String): ImageBitmap? = withContext(Dispatchers.IO) {
+        requestImageLoad(url) {
             val cachedImage = loadCachedImage(url)
 
-            if (cachedImage != null)
-                return@withContext cachedImage
+            cachedImage ?: loadImageNetwork(url)
+        }
+    }
 
+    private suspend fun loadImageNetwork(url: String): ImageBitmap? = withContext(Dispatchers.IO) {
+        printLog(TAG, "Loading avatar from URL $url")
+
+        try {
             loadingImagesSemaphore.acquireAndUse {
-                val imageByteArray = loadImage(url)
+                val imageByteArray = loadImageFromNetwork(url)
                 cache.cacheImage(url, imageByteArray)
                 return@withContext imageByteArray.toComposeImage()
             }
@@ -50,12 +55,40 @@ object NetworkImageLoader {
         return@withContext null
     }
 
-    suspend fun loadImage(link: String): ByteArray = withContext(Dispatchers.IO) {
+    fun loadCachedImage(url: String): ImageBitmap? {
+        val cachedImage = cache.getCachedImage(url)
+
+        return cachedImage?.toComposeImage()
+    }
+
+    private suspend fun loadImageFromNetwork(link: String): ByteArray = withContext(Dispatchers.IO) {
         val url = URL(link)
         val connection = url.openConnection() as HttpURLConnection
         connection.connect()
 
         connection.inputStream.toByteArray()
+    }
+
+    private suspend fun <T> requestImageLoad(
+        url: String,
+        block: suspend () -> T,
+    ): T {
+        val requestMutex = synchronized(requests) {
+            val existingMutex = requests[url]
+
+            if (existingMutex != null) {
+                existingMutex
+            } else {
+                val newMutex = Mutex()
+                requests[url] = newMutex
+
+                newMutex
+            }
+        }
+
+        return requestMutex.withLock {
+            block()
+        }
     }
 }
 
@@ -85,7 +118,7 @@ fun rememberNetworkImageOrNull(url: String, placeHolderImageRes: String? = null)
 
     LaunchedEffect(url) {
         if (!cacheImageUsed.value) {
-            val networkImage = NetworkImageLoader.loadImageNetwork(url)
+            val networkImage = NetworkImageLoader.loadImage(url)
 
             if (networkImage != null && !cacheImageUsed.value) {
                 image = networkImage
